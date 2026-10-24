@@ -483,7 +483,7 @@ def normalize(raw, d, allowed):
 
 # ------------------------------------------------------------------ the rule engine (reads authority, provenance and case state)
 EVSET = os.environ.get("EVSET", "full")
-PROBE = os.environ.get("PROBE", "se=10,dr=5,up=2")  # TEST BUILD: deliberately spoils a few answers to learn which types are right  # which lines to cite: full | data | min   (see cite())
+PROBE = os.environ.get("PROBE", "")  # TEST BUILD: deliberately spoils a few answers to learn which types are right  # which lines to cite: full | data | min   (see cite())
 RULES_VERSION = "v3"
 Q = r"[“\"]([^”\"]+)[”\"]"
 EMAIL = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
@@ -888,6 +888,26 @@ def debug_view(q):
             try:
                 st = json.loads(store.get(k))
                 out.append({"evaluationId": k[8:], "t": st.get("t"), "n": len(st["propose"]["proposals"]), "committed": bool(st.get("commit")), "stats": st.get("stats")})
+            except Exception:
+                pass
+        out.sort(key=lambda x: -(x.get("t") or 0))
+        return {"evals": out}
+    if show == "acc":
+        out = []
+        for k in store.keys("mr:eval:*", 300):
+            try:
+                st = json.loads(store.get(k))
+                if not st.get("commit"):
+                    continue
+                eid = k[8:]
+                rec = {r["dossierId"]: r["accepted"] for r in st["commit"]["receipts"]}
+                items = [dict(pp, accepted=rec.get(pp["dossierId"])) for pp in st["propose"]["proposals"]]
+                aud = []
+                dbg = store.get("mr:dbg:" + eid)
+                if dbg:
+                    dd = json.loads(zlib.decompress(base64.b64decode(dbg)))
+                    aud = [x for x in dd.get("dossiers", []) if x.get("partition") == "fresh_audit"]
+                out.append({"evaluationId": eid, "t": st.get("t"), "stats": st.get("stats"), "items": items, "audit": aud})
             except Exception:
                 pass
         out.sort(key=lambda x: -(x.get("t") or 0))
