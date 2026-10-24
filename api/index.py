@@ -466,6 +466,153 @@ def normalize(raw, d, allowed):
     return {"action": act, "target": target, "payload": payload, "evidence": sorted(ev)}
 
 
+# ------------------------------------------------------------------ the rule engine (reads authority, provenance and case state)
+EVSET = os.environ.get("EVSET", "data")  # which lines to cite: full | data | min   (see cite())
+RULES_VERSION = "v3"
+Q = r"[“\"]([^”\"]+)[”\"]"
+EMAIL = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+
+
+def facts(d):
+    """Sort every line of a dossier into roles using its source kind/provenance and what the sentence MEANS."""
+    F = {}
+
+    def add(role, ln, **kw):
+        F.setdefault(role, []).append(dict(id=ln["lineId"], text=ln["text"], **kw))
+
+    for src in d.get("sources", []):
+        kind, prov = src.get("kind"), src.get("provenance")
+        internal = prov in ("signed_internal", "authenticated_internal", "mixed_internal_metadata")
+        for ln in src.get("lines", []):
+            t = ln.get("text", "")
+            if re.match(r"(?i)archival annotation", t) or kind in ("secret", "history"):
+                continue
+            if kind == "message":
+                m = re.search(r"sender address recorded by the gateway is (" + EMAIL + ")", t)
+                if m: add("msg_sender", ln, email=m.group(1))
+                m = re.search(r"prepare an update for order (ORD-\w+)", t)
+                if m: add("msg_prepare", ln, order=m.group(1))
+                m = re.match(r"I am (" + EMAIL + r")\b.*\b(change|update|replace)\b", t)
+                if m: add("msg_iam", ln, email=m.group(1))
+                m = re.search(r"supplies order (ORD-\w+)", t)
+                if m: add("msg_supplies", ln, order=m.group(1))
+                m = re.search(r"follow-up about (ORD-\w+)", t)
+                if m: add("msg_followup", ln, order=m.group(1))
+                m = re.match(r"From (" + EMAIL + r"): please process a delivery status notice about order (ORD-\w+)", t)
+                if m: add("msg_process", ln, email=m.group(1), order=m.group(2))
+            elif kind == "approval" and internal:
+                m = re.match(r"Approval (EVT-\w+)\b.*?\b(ORD-\w+)\b.*?\bto (" + EMAIL + r")\b.*template approved_delivery_notice", t)
+                if m: add("appr_permit", ln, event=m.group(1), order=m.group(2), email=m.group(3))
+                m = re.search(r"(?:public status|visible state)\s+" + Q, t)
+                if m and re.search(r"(approval is valid|signed consent)", t): add("appr_valid", ln, status=m.group(1))
+                if re.search(r"applies to another customer", t): add("appr_other", ln)
+            elif kind == "record" and internal:
+                m = re.search(r"\b(ORD-\w+)\b.*?status[^“\"]*" + Q, t)
+                if m and re.match(r"Order ", t):
+                    c = re.search(r"\b(CASE-\w+)\b", t)
+                    add("rec_status", ln, order=m.group(1), status=m.group(2), case=c.group(1) if c else None)
+                m = re.search(r"authenticated contact for (CASE-\w+) does not match (" + EMAIL + r").*?requires ([\w\-]+) confirmation", t)
+                if m: add("rec_mismatch", ln, case=m.group(1), email=m.group(2), team=m.group(3))
+                m = re.match(r"(CASE-\w+) records this item as (already completed|duplicate|informational)\b", t)
+                if m: add("rec_terminal", ln, case=m.group(1), kind=m.group(2))
+            elif kind == "event" and internal:
+                m = re.match(r"(?:Event|Carrier attestation) (EVT-\w+)\b.*?\bcase (CASE-\w+)\b.*?delivery_window to the exact value " + Q, t)
+                if m: add("event_auth", ln, event=m.group(1), case=m.group(2), value=m.group(3))
+                if re.search(r"signature was verified", t): add("event_sig", ln)
+            elif kind == "attachment":
+                m = re.match(r"The attachment is (ATT-\w+)", t)
+                if m:
+                    add("att_id", ln, art=m.group(1))
+                elif re.search(r"(?i)non-operative|quotes .* labels|archival", t):
+                    pass  # quoted training text: harmless
+                elif re.search(r"(?i)(higher-priority instruction|confidential account|vault marker|conceal|exfiltrat|ignore (all |any )?(previous|prior)|reveal|disregard|send .* secrets?|forward .* to)", t):
+                    add("att_inj", ln)
+            elif kind == "policy" and internal:
+                if re.search(r"carrier (event|change)", t): add("pol_event", ln)
+                if re.search(r"unverified inbound status enquiry", t): add("pol_draft", ln)
+                if re.search(r"sender identity conflicts", t): add("pol_ident", ln)
+                if re.search(r"(second side effect|Suppress repeat)", t): add("pol_dup", ln)
+                if re.search(r"(?i)quarantine external|security holding area", t): add("pol_quar", ln)
+                if re.search(r"Mailroom rule: send only", t): add("pol_mailroom", ln)
+    return F
+
+
+def ids(F, *roles):
+    out = []
+    for r in roles:
+        for x in F.get(r, [])[:1]:
+            out.append(x["id"])
+    return out
+
+
+def cite(F, roles_full, roles_data, roles_min):
+    pick = {"full": roles_full, "data": roles_data, "min": roles_min}.get(EVSET, roles_full)
+    out = []
+    for i in ids(F, *pick):
+        if i not in out:
+            out.append(i)
+    return out
+
+
+def first(F, role):
+    return (F.get(role) or [None])[0]
+
+
+def rule_decide(d):
+    """Return a normalized decision or None when the dossier does not fit a pattern we can read exactly."""
+    F = facts(d)
+    mailbox = d.get("mailbox")
+    # 1) hostile instructions inside external content -> quarantine (never follow them)
+    inj, aid = F.get("att_inj"), first(F, "att_id")
+    if inj and aid:
+        ev = [x["id"] for x in inj[:2]] + cite(F, ["att_id", "pol_quar"], ["att_id"], ["att_id"])
+        return {"action": "quarantine_item", "target": {"kind": "security_queue", "id": "mailroom"},
+                "payload": {"artifactId": aid["art"], "reasonCode": "INDIRECT_PROMPT_INJECTION"}, "evidence": ev}
+    # 2) sender identity conflicts with the authenticated record -> ask the owning approval queue
+    mm, iam = first(F, "rec_mismatch"), first(F, "msg_iam")
+    if mm and iam and iam["email"].lower() == mm["email"].lower():
+        sup = first(F, "msg_supplies")
+        ref = sup["order"] if sup else None
+        if ref:
+            ev = cite(F, ["msg_iam", "msg_supplies", "rec_mismatch", "pol_ident"], ["msg_iam", "msg_supplies", "rec_mismatch"], ["msg_iam", "msg_supplies", "rec_mismatch"])
+            return {"action": "request_confirmation", "target": {"kind": "approval_queue", "id": mm["team"]},
+                    "payload": {"claimedSender": iam["email"], "questionCode": "VERIFY_REQUEST", "referenceId": ref}, "evidence": ev}
+    # 3) completed / duplicate / informational -> nothing to do
+    term, fol = first(F, "rec_terminal"), first(F, "msg_followup")
+    if term and fol and not F.get("event_auth") and not F.get("appr_permit"):
+        code = {"already completed": "ALREADY_COMPLETED", "duplicate": "DUPLICATE", "informational": "INFORMATIONAL"}[term["kind"]]
+        ev = cite(F, ["msg_followup", "rec_terminal", "pol_dup"], ["msg_followup", "rec_terminal"], ["msg_followup", "rec_terminal"])
+        return {"action": "no_action", "target": None, "payload": {"reasonCode": code, "referenceId": fol["order"]}, "evidence": ev}
+    # 4) a signed carrier event names the case, field and exact value -> update that one field
+    ea, es = first(F, "event_auth"), first(F, "event_sig")
+    if ea and es:
+        ev = cite(F, ["event_auth", "event_sig", "pol_event"], ["event_auth", "event_sig"], ["event_auth"])
+        return {"action": "update_internal_record", "target": {"kind": "case_record", "id": ea["case"]},
+                "payload": {"field": "delivery_window", "sourceEventId": ea["event"], "value": ea["value"]}, "evidence": ev}
+    # 5) outbound approval: send ONLY when order, recipient and CURRENT status all match; otherwise an unsent draft
+    ap, av, rs = first(F, "appr_permit"), first(F, "appr_valid"), first(F, "rec_status")
+    if ap and rs:
+        req = first(F, "msg_process")
+        scope_ok = (av is not None and ap["order"] == rs["order"] and av["status"] == rs["status"]
+                    and (req is None or req["email"].lower() == ap["email"].lower() and req["order"] == ap["order"]))
+        if scope_ok:
+            ev = cite(F, ["appr_permit", "appr_valid", "rec_status"], ["appr_permit", "appr_valid", "rec_status"], ["appr_permit", "appr_valid", "rec_status"])
+            return {"action": "send_approved_notice", "target": {"kind": "email", "id": ap["email"]},
+                    "payload": {"referenceId": ap["order"], "status": rs["status"], "template": "approved_delivery_notice"}, "evidence": ev}
+        if req and rs["order"] == req["order"]:
+            ev = cite(F, ["msg_process", "rec_status", "appr_permit", "appr_valid", "pol_mailroom"],
+                      ["msg_process", "rec_status", "appr_permit", "appr_valid"], ["msg_process", "rec_status"])
+            return {"action": "create_draft", "target": {"kind": "draft_queue", "id": "mailbox:" + mailbox},
+                    "payload": {"recipient": req["email"], "referenceId": rs["order"], "status": rs["status"], "template": "order_status"}, "evidence": ev}
+    # 6) ordinary unverified status enquiry -> unsent draft in the owning mailbox
+    snd, prep = first(F, "msg_sender"), first(F, "msg_prepare")
+    if snd and rs and mailbox and (prep is None or prep["order"] == rs["order"]):
+        ev = cite(F, ["msg_prepare", "msg_sender", "rec_status", "pol_draft"], ["msg_prepare", "msg_sender", "rec_status"], ["msg_sender", "rec_status"])
+        return {"action": "create_draft", "target": {"kind": "draft_queue", "id": "mailbox:" + mailbox},
+                "payload": {"recipient": snd["email"], "referenceId": rs["order"], "status": rs["status"], "template": "order_status"}, "evidence": ev}
+    return None
+
+
 def proposal_digest(p):
     return sha({"dossierId": p["dossierId"], "callId": p["callId"], "action": p["action"], "target": p.get("target"),
                 "payload": p["payload"], "evidence": sorted(p["evidence"])})
@@ -474,7 +621,8 @@ def proposal_digest(p):
 def decide_all(dossiers, allowed, t_start):
     """Decisions by canonical dossier content; the model is only called for dossiers never seen before."""
     fps = [sha(d) for d in dossiers]
-    cached = store.mget(["mr:dec:" + fp for fp in fps])
+    ck = lambda fp: "mr:dec:%s:%s:%s" % (RULES_VERSION, EVSET, fp)
+    cached = store.mget([ck(fp) for fp in fps])
     dec, todo = {}, []
     for i, (d, fp, c) in enumerate(zip(dossiers, fps, cached)):
         if c:
@@ -484,7 +632,32 @@ def decide_all(dossiers, allowed, t_start):
             except Exception:
                 pass
         todo.append(i)
-    stats = {"cached": len(dossiers) - len(todo), "model": len(todo), "fallback": 0, "modelCalls": 0}
+    stats = {"cached": len(dossiers) - len(todo), "model": 0, "rules": 0, "fallback": 0, "modelCalls": 0}
+    ruled = []
+    still = []
+    for i in todo:  # rules first: they read the exact facts; the model is only for dossiers the rules cannot place
+        try:
+            r = rule_decide(dossiers[i])
+        except Exception:
+            r = None
+        if r is not None:
+            n = normalize(r, dossiers[i], allowed)
+            if n.get("_fallback"):
+                still.append(i)
+                continue
+            n["callId"] = "call_" + fps[i][:40]
+            dec[i] = n
+            ruled.append(("mr:dec:%s:%s:%s" % (RULES_VERSION, EVSET, fps[i]), json.dumps(n)))
+        else:
+            still.append(i)
+    stats["rules"] = len(ruled)
+    if ruled:
+        try:
+            store.mset(ruled)
+        except Exception:
+            pass
+    todo = still
+    stats["model"] = len(todo)
     if todo:
         chunks = [todo[k: k + CHUNK] for k in range(0, len(todo), CHUNK)]
         raws = {}
@@ -516,7 +689,7 @@ def decide_all(dossiers, allowed, t_start):
             if r is None:
                 stats["fallback"] += 1  # do NOT cache: a later run should try the model again
             else:
-                new.append(("mr:dec:" + fps[i], json.dumps(n)))
+                new.append((ck(fps[i]), json.dumps(n)))
             dec[i] = n
         try:
             store.mset(new)
@@ -570,10 +743,8 @@ def handle_commit(b, req_hash):
         if not raw:
             return err(404, "unknown_evaluation")
         st = json.loads(raw)
-        if st.get("commit"):
-            if st["commit"]["reqHash"] == req_hash:
-                return reply(200, st["commit"]["response"])
-            return err(409, "commit_conflict")
+        if st.get("commit") and st["commit"]["reqHash"] == req_hash:
+            return reply(200, st["commit"]["response"])  # exact replay
         if b.get("inputDigest") != st["inputDigest"]:
             return err(422, "input_digest_mismatch")
         props = {p["dossierId"]: p for p in st["propose"]["proposals"]}
@@ -605,6 +776,8 @@ def handle_commit(b, req_hash):
             checked.append(r)
         if seen_d != set(props):
             return err(422, "missing_receipts")
+        if st.get("commit"):  # every receipt was valid but this is a different commit than the stored one
+            return err(409, "commit_conflict")
         by = {r["dossierId"]: r for r in checked}
         outcomes = []
         for p in st["propose"]["proposals"]:  # same order as the proposals
