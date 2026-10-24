@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.vercel
+.env
+dbg_*.json
+dbg_*.jsonl
+*.log
