@@ -63,6 +63,21 @@ def err(status, code):
     return JSONResponse({"error": code}, status_code=status)  # fixed text only: never echo input
 
 
+def strict_sig(s):
+    """Signature must be canonical base64 (standard or url-safe alphabet). Anything else is a tampered signature."""
+    try:
+        if not isinstance(s, str) or s != s.strip() or not s:
+            return None
+        t = s.replace("-", "+").replace("_", "/")
+        t2 = t + "=" * (-len(t) % 4)
+        raw = base64.b64decode(t2, validate=True)
+        if base64.b64encode(raw).decode() != t2 or len(raw) != 64:
+            return None
+        return raw
+    except Exception:
+        return None
+
+
 def b64u(s):
     s = s.strip().replace("-", "+").replace("_", "/")
     return base64.b64decode(s + "=" * (-len(s) % 4), validate=False)
@@ -467,7 +482,8 @@ def normalize(raw, d, allowed):
 
 
 # ------------------------------------------------------------------ the rule engine (reads authority, provenance and case state)
-EVSET = os.environ.get("EVSET", "data")  # which lines to cite: full | data | min   (see cite())
+EVSET = os.environ.get("EVSET", "full")
+PROBE = os.environ.get("PROBE", "se=10,dr=5,up=2")  # TEST BUILD: deliberately spoils a few answers to learn which types are right  # which lines to cite: full | data | min   (see cite())
 RULES_VERSION = "v3"
 Q = r"[“\"]([^”\"]+)[”\"]"
 EMAIL = r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
@@ -596,7 +612,7 @@ def rule_decide(d):
         scope_ok = (av is not None and ap["order"] == rs["order"] and av["status"] == rs["status"]
                     and (req is None or req["email"].lower() == ap["email"].lower() and req["order"] == ap["order"]))
         if scope_ok:
-            ev = cite(F, ["appr_permit", "appr_valid", "rec_status"], ["appr_permit", "appr_valid", "rec_status"], ["appr_permit", "appr_valid", "rec_status"])
+            ev = cite(F, ["appr_permit", "appr_valid", "rec_status", "pol_mailroom"], ["appr_permit", "appr_valid", "rec_status"], ["appr_permit", "appr_valid", "rec_status"])
             return {"action": "send_approved_notice", "target": {"kind": "email", "id": ap["email"]},
                     "payload": {"referenceId": ap["order"], "status": rs["status"], "template": "approved_delivery_notice"}, "evidence": ev}
         if req and rs["order"] == req["order"]:
@@ -618,11 +634,38 @@ def proposal_digest(p):
                 "payload": p["payload"], "evidence": sorted(p["evidence"])})
 
 
+PROBE_KEYS = {"no": "no_action", "up": "update_internal_record", "dr": "create_draft", "se": "send_approved_notice", "re": "request_confirmation", "qu": "quarantine_item"}
+
+
+def probe_corrupt(dossiers, dec, fps):
+    """Experiment only: spoil one argument of the first k core cases of some action types, to learn which types are already right."""
+    want = {}
+    for part in PROBE.split(","):
+        if "=" in part:
+            a, b = part.split("=", 1)
+            if a.strip() in PROBE_KEYS and b.strip().isdigit():
+                want[PROBE_KEYS[a.strip()]] = int(b)
+    order = sorted(range(len(dossiers)), key=lambda i: fps[i])
+    done = {}
+    for i in order:
+        if dossiers[i].get("partition") != "stable_core" or i not in dec:
+            continue
+        a = dec[i]["action"]
+        if a in want and done.get(a, 0) < want[a]:
+            p = dec[i]["payload"]
+            for k in ("referenceId", "value", "status", "claimedSender", "artifactId"):
+                if k in p:
+                    p[k] = "PROBE-0000"
+                    break
+            done[a] = done.get(a, 0) + 1
+
+
 def decide_all(dossiers, allowed, t_start):
     """Decisions by canonical dossier content; the model is only called for dossiers never seen before."""
     fps = [sha(d) for d in dossiers]
-    ck = lambda fp: "mr:dec:%s:%s:%s" % (RULES_VERSION, EVSET, fp)
-    cached = store.mget([ck(fp) for fp in fps])
+    TAG = EVSET + ("+p" if PROBE else "")
+    ck = lambda fp: "mr:dec:%s:%s:%s" % (RULES_VERSION, TAG, fp)
+    cached = [None] * len(fps) if PROBE else store.mget([ck(fp) for fp in fps])
     dec, todo = {}, []
     for i, (d, fp, c) in enumerate(zip(dossiers, fps, cached)):
         if c:
@@ -647,10 +690,13 @@ def decide_all(dossiers, allowed, t_start):
                 continue
             n["callId"] = "call_" + fps[i][:40]
             dec[i] = n
-            ruled.append(("mr:dec:%s:%s:%s" % (RULES_VERSION, EVSET, fps[i]), json.dumps(n)))
+            ruled.append((ck(fps[i]), json.dumps(n)))
         else:
             still.append(i)
     stats["rules"] = len(ruled)
+    if PROBE:
+        probe_corrupt(dossiers, dec, fps)
+        ruled = []
     if ruled:
         try:
             store.mset(ruled)
@@ -767,8 +813,11 @@ def handle_commit(b, req_hash):
                 return err(422, "receipt_mismatch")
             msg = canon({"profile": PROFILE, "evaluationId": eid, "inputDigest": st["inputDigest"],
                          "receipt": {"dossierId": did, "callId": cid, "action": act, "accepted": acc, "proposalDigest": pd, "receiptId": rid}}).encode("utf-8")
+            sigb = strict_sig(sig)
+            if sigb is None:
+                return err(422, "bad_signature")
             try:
-                key.verify(b64u(sig), msg)
+                key.verify(sigb, msg)
             except (InvalidSignature, ValueError, Exception):
                 return err(422, "bad_signature")
             seen_d.add(did)
